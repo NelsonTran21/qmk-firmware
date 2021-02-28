@@ -129,6 +129,9 @@
 #    ifndef MK_KINETIC_MOUSE_FRIC
 #        define MK_KINETIC_MOUSE_FRIC 0x20
 #    endif
+#    ifndef MK_KINETIC_MOUSE_JERK
+#        define MK_KINETIC_MOUSE_JERK 0x20
+#    endif
 #    ifndef MK_KINETIC_MOUSE_MAXS
 #        define MK_KINETIC_MOUSE_MAXS 0x80
 #    endif
@@ -141,6 +144,9 @@
 #    endif
 #    ifndef MK_KINETIC_WHEEL_FRIC
 #        define MK_KINETIC_WHEEL_FRIC 0x08
+#    endif
+#    ifndef MK_KINETIC_WHEEL_JERK
+#        define MK_KINETIC_WHEEL_JERK 0x08
 #    endif
 #    ifndef MK_KINETIC_WHEEL_MAXS
 #        define MK_KINETIC_WHEEL_MAXS 0x0c
@@ -257,6 +263,11 @@ static inline int16_t ssadd16(int16_t a, int16_t b) {
     return (pos == (b < sat - a)) ? (int16_t)(a + b) : sat;
 }
 
+/* Saturated unsigned addition ≤ `MAX` ≡ 2ⁿ-1. */
+static inline uint16_t suadd15(uint16_t a, uint16_t b) {
+    return (a < INT16_MAX - b) ? (uint16_t)(a + b) : INT16_MAX;
+}
+
 /* TODO Try these:
  * __builtin_add_overflow from GCC 5.5.0 onwards
  * __builtin_add_overflow_p from GCC 7.1.0 onwards
@@ -293,6 +304,7 @@ typedef struct {
 #elif MK_KIND(MK_TYPE_KINETIC)
     dxdy_t  rem;
     int16_t v_x, v_y; /* velocity */
+    uint16_t a_j_x, a_j_y; /* acceleration due to jerk */
 #endif
 } axes_t;
 
@@ -353,7 +365,7 @@ static x11_t wheel = MK_X11_WHEEL;
 #elif MK_KIND(MK_TYPE_KINETIC)
 
 /*
- * Kinetic movement: cursor follows classical mechanics with
+ * Kinetic movement: cursor follows classical mechanics with jerk,
  * fluid (but not viscous) drag and Coulombian kinetic friction.
  *
  * Parameters:
@@ -361,11 +373,13 @@ static x11_t wheel = MK_X11_WHEEL;
  *  accn: acceleration when `key_down`
  *  drag: drag coefficient
  *  fric: friction coefficient
+ *  jerk: jerk when `key_down`
  *  maxs: max speed in `report_mouse_t` units / 15ms
  *
  * Non-linear ODE (Riccati w/ q₁ = 0) model:
  *
- *  a(t) = fric + (key_down(t) ? diagonal(t) ? accn/√2 : accn : 0)
+ *  j(t) = (key_down(t) ? diagonal(t) ? jerk/√2 : jerk : 0)
+ *  a(t) = (key_down(t) ? diagonal(t) ? accn/√2 : accn : 0) + fric + j(t) × t
  *  dv(t)/dt = dir(t) × a(t) - sgn(v(t)) × (fric + drag × v(t)²)
  *
  * where `v(t)` is velocity, with `dir(t)` ∈ {0,±1}, `key_down(t)`, and
@@ -386,6 +400,7 @@ static x11_t wheel = MK_X11_WHEEL;
  * Playing fast & loose with the Euler method, we can rewrite
  * the above as a recurrence relation with time step `dt`:
  *
+ *  a(t+dt) = a(t) + j(t) × dt
  *  v(t+dt) = v(t) + a(t) × dt
  *      - sgn(v) × (fric + drag × v(t)²) × dt
  *
@@ -397,6 +412,7 @@ static x11_t wheel = MK_X11_WHEEL;
  *
  * References:
  *
+ *  https://en.wikipedia.org/wiki/Jerk_(physics)
  *  https://en.wikipedia.org/wiki/Drag_equation
  *  https://en.wikipedia.org/wiki/Coulomb_damping
  *  https://en.wikipedia.org/wiki/Ordinary_differential_equation
@@ -409,6 +425,7 @@ typedef struct {
     uint8_t accn; /* L×T⁻² */
     uint8_t drag; /* L⁻¹ */
     uint8_t fric; /* L×T⁻² */
+    uint8_t jerk; /* L×T⁻³ */
     uint8_t maxs; /* `report_mouse_t` units per 15ms */
 } kinetic_t;
 
@@ -417,6 +434,7 @@ typedef struct {
              { .accn = MK_KINETIC_MOUSE_ACCN \
              , .drag = MK_KINETIC_MOUSE_DRAG \
              , .fric = MK_KINETIC_MOUSE_FRIC \
+             , .jerk = MK_KINETIC_MOUSE_JERK \
              , .maxs = MK_KINETIC_MOUSE_MAXS \
              } /* clang-format on */
 #    endif
@@ -426,6 +444,7 @@ typedef struct {
              { .accn = MK_KINETIC_WHEEL_ACCN \
              , .drag = MK_KINETIC_WHEEL_DRAG \
              , .fric = MK_KINETIC_WHEEL_FRIC \
+             , .jerk = MK_KINETIC_WHEEL_JERK \
              , .maxs = MK_KINETIC_WHEEL_MAXS \
              } /* clang-format on */
 #    endif
@@ -543,14 +562,25 @@ dxdy_t kinetic_step(const kinetic_t *what, axes_t *axes) {
     int16_t maxs_dt = (int16_t)(maxs * dt); /* 12 bits */
 
     uint8_t accn = cardinal(axes->dxdy, what->accn);
+    uint8_t jerk = cardinal(axes->dxdy, what->jerk);
 
-    int8_t kinetic(int8_t dir, int16_t * pv, int8_t * rem) {
+    int8_t kinetic(int8_t dir, int16_t * pv, uint16_t *pa_jerk, int8_t * rem) {
         int16_t v = *pv;
+        uint16_t a_jerk = jerk ? *pa_jerk : 0; /* reset a_jerk when jerk ≡ 0 */
+
+        /* 14 bits */
+        uint16_t jerk_dt = (uint16_t)jerk * dt << 2;
+        /* 15 bits; saturates after 2¹⁵⁻¹⁴×(2⁸/jerk)×15ms */
+        *pa_jerk = suadd15(a_jerk, jerk_dt);
+        uint16_t a_jerk_avg = (a_jerk + *pa_jerk) >> 1; /* this is fine: both are 15 bits */
 
         /* 9 bits; ensure acceleration ≥ friction */
         uint16_t a_fric = (uint16_t)((uint16_t)accn + what->fric);
-        /* ±15 bits; dir: 1 bit, dt: 4 bits, a_fric: 9+2=11 bits */
-        int16_t a_dt = (int16_t)(dir * (int16_t)(a_fric << 2) * dt);
+        /* 15 bits; a_fric: 9+6=15 bits, a_jerk_avg: 15 bits */
+        uint16_t a_fric_jerk = suadd15(a_fric << 6, a_jerk_avg);
+
+        /* ±15 bits; dir: 1 bit, dt: 4 bits, a_fric_jerk: 15 bits */
+        int16_t a_dt = dir * (int16_t)NORM_POSI(4, a_fric_jerk * dt);
         /* v(t) + a(t) × dt: ±15 bits; v: ±15 bits, a_dt: ±15 bits */
         int16_t v_a = ssadd16(v, a_dt);
 
@@ -593,6 +623,8 @@ dxdy_t kinetic_step(const kinetic_t *what, axes_t *axes) {
         if (debug_config.enable && (v || dir)) {
             xprintf(/* clang-format off */
                 "dt: %u, v: %04X"
+                ", a_jerk: %04X, jerk_dt: %04X"
+                ", a_fric: %04X"
                 ", a_dt: %04X"
                 ", drag_v2: %04X"
 /*                ", loss: %04X"*/
@@ -604,6 +636,8 @@ dxdy_t kinetic_step(const kinetic_t *what, axes_t *axes) {
                 "\n"
 
                 , dt, v
+                , a_jerk, jerk_dt
+                , a_fric
                 , a_dt
                 , drag_v2
 /*                , loss*/
@@ -620,8 +654,8 @@ dxdy_t kinetic_step(const kinetic_t *what, axes_t *axes) {
     }
 
     return (dxdy_t) /* clang-format off */
-        { .dx = kinetic(axes->dxdy.dx, &axes->v_x, &axes->rem.dx)
-        , .dy = kinetic(axes->dxdy.dy, &axes->v_y, &axes->rem.dy)
+        { .dx = kinetic(axes->dxdy.dx, &axes->v_x, &axes->a_j_x, &axes->rem.dx)
+        , .dy = kinetic(axes->dxdy.dy, &axes->v_y, &axes->a_j_y, &axes->rem.dy)
         }; /* clang-format on */
 }
 
@@ -770,6 +804,8 @@ static void send_dxdy(dxdy_t m, dxdy_t w) {
                 " w: %02X %02X"
             ", vel m: %04X %04X"
                 " w: %04X %04X"
+            ", acc m: %04X %04X"
+                " w: %04X %04X"
             ", exps: %u"
 #elif MK_KIND(MK_TYPE_3_SPEED)
             ", speed: %S"
@@ -788,6 +824,8 @@ static void send_dxdy(dxdy_t m, dxdy_t w) {
             , wheel_axes.dxdy.dx, wheel_axes.dxdy.dy
             , mouse_axes.v_x, mouse_axes.v_y
             , wheel_axes.v_x, wheel_axes.v_y
+            , mouse_axes.a_j_x, mouse_axes.a_j_y
+            , wheel_axes.a_j_x, wheel_axes.a_j_y
             , exps
 #elif MK_KIND(MK_TYPE_3_SPEED)
             , speed_enum[speed]
@@ -884,13 +922,15 @@ static void print_kinetic_t(uint8_t n, PGM_P name, const kinetic_t *what) {
         "%u: .accn: %u\n"
         "%u: .drag: %u\n"
         "%u: .fric: %u\n"
+        "%u: .jerk: %u\n"
         "%u: .maxs: %u\n"
 
         , name
         , n + 1, what->accn
         , n + 2, what->drag
         , n + 3, what->fric
-        , n + 4, what->maxs
+        , n + 4, what->jerk
+        , n + 5, what->maxs // FIXME: 10?
 
         ); /* clang-format on */
 }
@@ -911,7 +951,7 @@ static void mousekey_param_print(void) {
 
 #        elif MK_KIND(MK_TYPE_KINETIC)
     print_kinetic_t(0, PSTR("mouse"), &mouse);
-    print_kinetic_t(4, PSTR("wheel"), &wheel);
+    print_kinetic_t(5, PSTR("wheel"), &wheel);
 
 #        elif MK_KIND(MK_TYPE_3_SPEED)
     print("\tmouse\n");
@@ -988,11 +1028,14 @@ bool mousekey_console(uint8_t code) {
             PARAM(1, mouse.accn);
             PARAM(2, mouse.drag);
             PARAM(3, mouse.fric);
-            PARAM(4, mouse.maxs);
-            PARAM(5, wheel.accn);
-            PARAM(6, wheel.drag);
-            PARAM(7, wheel.fric);
-            PARAM(8, wheel.maxs);
+            PARAM(4, mouse.jerk);
+            PARAM(5, mouse.maxs);
+
+            PARAM(6, wheel.accn);
+            PARAM(7, wheel.drag);
+            PARAM(8, wheel.fric);
+            PARAM(9, wheel.jerk);
+            PARAM(10, wheel.maxs);
 
 #    elif MK_KIND(MK_TYPE_3_SPEED)
 #           define PARAM(n, v) case n: pp += offsetof(speed_t, v); break
@@ -1127,13 +1170,13 @@ bool mousekey_console(uint8_t code) {
             ); /* clang-format on */
 
 #        elif MK_KIND(MK_TYPE_KINETIC)
-        static const char PROGMEM kinetic_field[4][5] = /* clang-format off */
-            {"accn", "drag", "fric", "maxs"};
+        static const char PROGMEM kinetic_field[5][5] = /* clang-format off */
+            {"accn", "drag", "fric", "jerk", "maxs"};
         xprintf(/* clang-format off */
             "M%u:%S.%S> "
             , param
-            , i & 4 ? PSTR("wheel") : PSTR("mouse")
-            , kinetic_field[i & 3]
+            , i > 5 ? PSTR("wheel") : PSTR("mouse")
+            , kinetic_field[i > 5 ? i - 5 : i]
             ); /* clang-format on */
 
 #        elif MK_KIND(MK_TYPE_3_SPEED)
