@@ -390,6 +390,7 @@ static x11_t wheel = MK_X11_WHEEL;
  * This feels like the more intuitive behaviour for the end-user,
  * rather than requiring `accn > fric` for any acceleration at all.
  *
+ * `jerk = 0`
  * For `v(t) > 0`, `a(t) - fric = accn`, and starting with `v(0) = 0`,
  * there is a closed-form solution for `v(t)`:
  *
