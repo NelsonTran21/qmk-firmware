@@ -16,6 +16,24 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 #pragma once
 
+/* GCC ≥ 10 and Clang have __has_builtin() & __has_attribute(); until then… */
+
+#ifndef __has_builtin
+#    define __has_builtin(_) 0
+#endif
+
+#ifndef __has_attribute
+#    define __has_attribute(_) 0
+#endif
+
+#if defined(__GNUC__) || __has_attribute(noinline)
+#    define Q_NEVER_INLINE __attribute__((noinline))
+#endif
+
+#if defined(__GNUC__) || __has_attribute(always_inline)
+#    define Q_ALWAYS_INLINE inline __attribute__((always_inline))
+#endif
+
 #include "bitwise.h"
 
 // convert to L string
