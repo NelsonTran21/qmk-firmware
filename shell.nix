@@ -2,8 +2,8 @@
 
 let
   nixpkgs = builtins.fetchTarball {
-    url = "https://github.com/NixOS/nixpkgs/archive/c4b26e702044dbf40f8236136c099d8ab6778514.tar.gz";
-    sha256 = "0w6hgs01qzni3a7cvgadjlmcdlb6vay3w910vh4k9fc949ii7s60";
+    url = "https://github.com/NixOS/nixpkgs/archive/4fc6705e2b8d530132cb81f841084b7b.tar.gz";
+    sha256 = "1mjq6pxzn8x48jgqynqcwibc9fcp1rjhjihs6bfimgxpp6vj7bwl";
   };
 
   pkgs = import nixpkgs { };
@@ -43,7 +43,9 @@ let
     appdirs
     argcomplete
     colorama
+    dotty-dict
     hjson
+    jsonschema
     milc
     pygments
     # requirements-dev.txt
