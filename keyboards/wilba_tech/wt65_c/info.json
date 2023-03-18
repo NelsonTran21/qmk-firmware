@@ -5,8 +5,7 @@
     "maintainer": "Wilba",
     "usb": {
         "vid": "0x6582",
-        "pid": "0x0028",
-        "device_version": "0.0.1"
+        "pid": "0x0028"
     },
     "processor": "atmega32u4",
     "bootloader": "atmel-dfu",
